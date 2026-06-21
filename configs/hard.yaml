@@ -1,0 +1,27 @@
+# ============================================================
+#  Hard Preset — Deep RL Robot Navigation
+# ============================================================
+#  Smaller, cluttered world with many large obstacles, a tiny
+#  goal, and limited sensor range.  The agent must learn precise
+#  obstacle avoidance and careful path planning to succeed.
+# ============================================================
+
+world:
+  width: 600
+  height: 450
+  num_obstacles_min: 5
+  num_obstacles_max: 8
+  obstacle_width_min: 50
+  obstacle_width_max: 150
+  obstacle_height_min: 50
+  obstacle_height_max: 150
+
+robot:
+  step_size: 4.0
+  sensor_range: 120
+
+goal:
+  radius: 15
+
+training:
+  total_timesteps: 300000

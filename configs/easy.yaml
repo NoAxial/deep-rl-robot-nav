@@ -1,0 +1,19 @@
+# ============================================================
+#  Easy Preset — Deep RL Robot Navigation
+# ============================================================
+#  Large open world with very few obstacles, a generous goal
+#  radius, and extended sensor range.  The robot has plenty of
+#  room to learn basic navigation without tight manoeuvring.
+# ============================================================
+
+world:
+  width: 1000
+  height: 800
+  num_obstacles_min: 1
+  num_obstacles_max: 2
+
+robot:
+  sensor_range: 300
+
+goal:
+  radius: 30

@@ -1,0 +1,15 @@
+# ============================================================
+#  Fast Preset — Deep RL Robot Navigation
+# ============================================================
+#  High-speed robot with a large step size and wide turning
+#  angle.  Converges quickly so fewer timesteps are needed.
+#  Good for rapid iteration and testing new reward functions.
+# ============================================================
+
+robot:
+  radius: 15
+  step_size: 8.0
+  turn_angle: 25
+
+training:
+  total_timesteps: 100000

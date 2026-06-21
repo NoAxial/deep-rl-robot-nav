@@ -1,0 +1,23 @@
+# ============================================================
+#  Maze Preset — Deep RL Robot Navigation
+# ============================================================
+#  Standard-sized world filled with many narrow, elongated
+#  obstacles that form corridor-like passages.  Obstacles are
+#  either tall-and-thin or wide-and-flat, creating a maze the
+#  robot must navigate through with moderate sensor range.
+# ============================================================
+
+world:
+  num_obstacles_min: 6
+  num_obstacles_max: 10
+  obstacle_width_min: 20
+  obstacle_width_max: 200
+  obstacle_height_min: 20
+  obstacle_height_max: 200
+
+robot:
+  step_size: 4.0
+  sensor_range: 150
+
+training:
+  total_timesteps: 300000

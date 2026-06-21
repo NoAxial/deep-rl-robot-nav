@@ -1,0 +1,72 @@
+# ============================================================
+#  Default Configuration — Deep RL Robot Navigation
+# ============================================================
+#  Edit values below OR create a new YAML with only the keys
+#  you want to override.  Missing keys are auto-filled from
+#  the built-in defaults in config.py.
+# ============================================================
+
+world:
+  width: 800
+  height: 600
+  num_obstacles_min: 3
+  num_obstacles_max: 5
+  obstacle_width_min: 40
+  obstacle_width_max: 120
+  obstacle_height_min: 30
+  obstacle_height_max: 90
+  dynamic_obstacles: false
+  dynamic_speed_min: 1.0
+  dynamic_speed_max: 3.0
+
+robot:
+  radius: 12
+  step_size: 5.0
+  turn_angle: 15            # degrees
+  num_sensors: 32           # HD LIDAR
+  sensor_range: 200
+  action_mode: car_continuous # basic, car, extended, continuous, car_continuous
+
+goal:
+  radius: 20
+
+rewards:
+  goal: 100.0
+  collision: -10.0
+  step_penalty: -0.05
+  velocity_reward: 0.5
+  clear_path_reward: 0.1
+  distance_shaping: 0.0
+  heading_bonus: 0.0
+  proximity_penalty: 0.5
+  proximity_threshold: 0.25
+  speed_bonus: 50.0
+  spin_penalty: 0.05
+  jerk_penalty: 0.1
+
+training:
+  algorithm: SAC
+  total_timesteps: 400000
+  n_envs: 8
+  learning_rate: 0.0003
+  buffer_size: 100000
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 1
+  learning_starts: 1000
+  ent_coef: auto
+  device: cpu
+  early_stopping: true
+  reward_threshold: 120.0
+  eval_freq: 5000
+  n_eval_episodes: 20
+  normalize_obs: true
+  normalize_reward: true
+  net_arch_pi: [256, 256, 128]
+  net_arch_vf: [256, 256, 128]
+  activation: relu
+
+episode:
+  max_steps: 500
