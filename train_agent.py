@@ -130,7 +130,6 @@ def main() -> None:
     
     # Custom Feature Extractor args
     n_sensors = int(cfg["robot"]["num_sensors"])
-    
     policy_kwargs = dict(
         net_arch=dict(
             pi=list(t_cfg["net_arch_pi"]),
@@ -138,7 +137,7 @@ def main() -> None:
         ),
         activation_fn=_get_activation(t_cfg["activation"]),
         features_extractor_class=CustomCombinedExtractor,
-        features_extractor_kwargs=dict(features_dim=256, num_sensors=n_sensors, n_stack=4)
+        features_extractor_kwargs=dict(features_dim=256, n_stack=4)
     )
 
     lr = float(t_cfg["learning_rate"])
@@ -168,35 +167,90 @@ def main() -> None:
     print("\n[4/5] Setting up callbacks ...")
     callbacks = [MetricsCallback(freq=10_000)]
 
+    # Separate eval env (also normalised with training stats)
+    eval_env = make_vec_env(_make_env(cfg), n_envs=1)
+    
+    # Wrap with Frame Stacking
+    eval_env = VecFrameStack(eval_env, n_stack=4)
+
+    if t_cfg["normalize_obs"]:
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=True,
+            norm_reward=False,
+            clip_obs=10.0,
+            training=False,
+        )
+
+    # Custom callback: sync eval norm stats + save checkpoints periodically
+    class SyncAndSaveCallback(BaseCallback):
+        """Syncs eval VecNormalize stats from training env before each eval,
+           saves vec_normalize.pkl whenever a new best model is saved,
+           and periodically saves a 'latest' checkpoint every `save_freq` steps."""
+        def __init__(self, model_ref, train_env, eval_env, save_path,
+                     save_freq=10_000, verbose=0):
+            super().__init__(verbose)
+            self.model_ref = model_ref
+            self.train_env = train_env
+            self.eval_env = eval_env
+            self.save_path = Path(save_path)
+            self.save_freq = save_freq
+            self._last_best = None
+            self._last_periodic = 0
+
+        def _on_step(self) -> bool:
+            # Sync running mean/var from training env to eval env
+            if isinstance(self.train_env, VecNormalize) and isinstance(self.eval_env, VecNormalize):
+                self.eval_env.obs_rms = self.train_env.obs_rms
+                self.eval_env.ret_rms = self.train_env.ret_rms
+
+            # Check if a new best_model was just saved by EvalCallback
+            best_model_path = self.save_path / "best_model.zip"
+            if best_model_path.exists():
+                mtime = best_model_path.stat().st_mtime
+                if self._last_best is None or mtime > self._last_best:
+                    self._last_best = mtime
+                    # Save vec_normalize.pkl alongside best_model
+                    if isinstance(self.train_env, VecNormalize):
+                        self.train_env.save(str(self.save_path / "vec_normalize.pkl"))
+                        if self.verbose:
+                            print(f"      [SAVE] vec_normalize.pkl synced with best_model")
+
+            # Periodic save of latest model + norm stats every save_freq steps
+            if self.num_timesteps - self._last_periodic >= self.save_freq:
+                self._last_periodic = self.num_timesteps
+                self.model.save("robot_nav_model")
+                if isinstance(self.train_env, VecNormalize):
+                    self.train_env.save("vec_normalize.pkl")
+                if self.verbose:
+                    print(f"      [CHECKPOINT] Saved latest model @ {self.num_timesteps:,} steps")
+
+            return True
+
+    sync_cb = SyncAndSaveCallback(
+        model_ref=None,  # will be set by SB3 via self.model
+        train_env=vec_env, eval_env=eval_env,
+        save_path="./best_model/", save_freq=10_000, verbose=1
+    )
+    callbacks.append(sync_cb)
+
+    stop_cb = None
     if t_cfg["early_stopping"]:
-        # Separate eval env (also normalised with training stats)
-        eval_env = make_vec_env(_make_env(cfg), n_envs=1)
-        
-        # Wrap with Frame Stacking
-        eval_env = VecFrameStack(eval_env, n_stack=4)
-
-        if t_cfg["normalize_obs"]:
-            eval_env = VecNormalize(
-                eval_env,
-                norm_obs=True,
-                norm_reward=False,
-                clip_obs=10.0,
-            )
-
         stop_cb = StopTrainingOnRewardThreshold(
             reward_threshold=float(t_cfg["reward_threshold"]), verbose=1
         )
-        eval_cb = EvalCallback(
-            eval_env,
-            callback_on_new_best=stop_cb,
-            eval_freq=max(int(t_cfg["eval_freq"]) // n_envs, 1),
-            n_eval_episodes=int(t_cfg["n_eval_episodes"]),
-            best_model_save_path="./best_model/",
-            verbose=1,
-        )
-        callbacks.append(eval_cb)
         print(f"      [OK] Early stopping at reward >= {t_cfg['reward_threshold']}")
-        print(f"      [OK] Eval every {t_cfg['eval_freq']} steps ({t_cfg['n_eval_episodes']} episodes)")
+
+    eval_cb = EvalCallback(
+        eval_env,
+        callback_on_new_best=stop_cb,
+        eval_freq=max(int(t_cfg["eval_freq"]) // n_envs, 1),
+        n_eval_episodes=int(t_cfg["n_eval_episodes"]),
+        best_model_save_path="./best_model/",
+        verbose=1,
+    )
+    callbacks.append(eval_cb)
+    print(f"      [OK] Eval every {t_cfg['eval_freq']} steps ({t_cfg['n_eval_episodes']} episodes)")
 
     # Curriculum callback
     from curriculum import PerformanceCurriculumCallback
@@ -205,13 +259,14 @@ def main() -> None:
     while hasattr(inner_vec, 'venv'):
         inner_vec = inner_vec.venv
         
-    raw_env_instance = inner_vec.envs[0]
-    if hasattr(raw_env_instance, 'unwrapped'):
-        try:
-            raw_env_instance = raw_env_instance.unwrapped
-        except:
-            pass
-    curr_callback = PerformanceCurriculumCallback(raw_envs=[raw_env_instance], window_size=50, verbose=1)
+    raw_envs = []
+    for env_i in inner_vec.envs:
+        if hasattr(env_i, 'unwrapped'):
+            raw_envs.append(env_i.unwrapped)
+        else:
+            raw_envs.append(env_i)
+            
+    curr_callback = PerformanceCurriculumCallback(raw_envs=raw_envs, window_size=50, verbose=1)
     callbacks.append(curr_callback)
 
     # ---- 5. Train ----

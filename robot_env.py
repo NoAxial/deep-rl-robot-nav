@@ -36,6 +36,7 @@ from shapely.geometry import LineString, Point
 from shapely.geometry import box as shapely_box
 
 from config import DEFAULT_CONFIG
+from kalman_filter import RobotEKF
 
 
 class RobotNavEnv(gym.Env):
@@ -68,14 +69,9 @@ class RobotNavEnv(gym.Env):
 
         # Robot
         self.robot_radius: float = float(r_cfg["radius"])
-        self.base_step_size: float = float(r_cfg["step_size"])
-        self.base_turn_angle: float = np.radians(float(r_cfg["turn_angle"]))
-        self.step_size: float = self.base_step_size
-        self.turn_angle: float = self.base_turn_angle
         self.num_sensors: int = int(r_cfg["num_sensors"])
         self.base_sensor_range: float = float(r_cfg["sensor_range"])
         self.sensor_range: float = self.base_sensor_range
-        self.action_mode: str = str(r_cfg.get("action_mode", "basic"))
 
         # Goal
         self.goal_radius: float = float(g_cfg["radius"])
@@ -96,29 +92,46 @@ class RobotNavEnv(gym.Env):
 
         # Episode
         self.max_steps: int = int(ep_cfg["max_steps"])
+        
+        # Physics
+        p_cfg = cfg.get("physics", {})
+        self.mass = float(p_cfg.get("mass", 10.0))
+        self.inertia = float(p_cfg.get("inertia", 0.5))
+        self.track_width = float(p_cfg.get("track_width", 20.0))
+        self.wheel_radius = float(p_cfg.get("wheel_radius", 5.0))
+        self.motor_torque_max = float(p_cfg.get("motor_torque_max", 20.0))
+        self.friction_coeff = float(p_cfg.get("friction_coeff", 0.1))
+        self.physics_substeps = int(p_cfg.get("physics_substeps", 10))
+        self.dt = float(p_cfg.get("dt", 0.1))
+        
+        # Sensors
+        s_cfg = cfg.get("sensors", {})
+        self.lidar_noise_std = float(s_cfg.get("lidar_noise_std", 2.0))
+        self.odom_noise_std = float(s_cfg.get("odom_noise_std", 0.5))
+        
+        # Control
+        c_cfg = cfg.get("control", {})
+        self.pid_kp = float(c_cfg.get("pid_kp", 5.0))
+        self.pid_ki = float(c_cfg.get("pid_ki", 0.1))
+        self.pid_kd = float(c_cfg.get("pid_kd", 0.5))
 
         # ---- Spaces ----
-        # Obs: N_sensors + 8 extra features (added speed)
-        obs_dim = self.num_sensors + 8
-        low = np.zeros(obs_dim, dtype=np.float32)
-        high = np.ones(obs_dim, dtype=np.float32)
-        # Relative goal dx, dy, angle_to_goal, and speed can be negative
+        # Observation dimension: LIDAR + local_dx, local_dy, goal_dist, angle_diff, pa_v, pa_w, step_norm, min_lidar, speed_norm, omega_norm
+        obs_dim_per_frame = self.num_sensors + 10
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim_per_frame,), dtype=np.float32)
+        low = np.zeros(obs_dim_per_frame, dtype=np.float32)
+        high = np.ones(obs_dim_per_frame, dtype=np.float32)
+        # Relative goal dx, dy, angle_to_goal, prev actions, speed, and omega can be negative
         low[self.num_sensors]     = -1.0   # local_dx
         low[self.num_sensors + 1] = -1.0   # local_dy
         low[self.num_sensors + 3] = -1.0   # angle_to_goal
-        low[self.num_sensors + 7] = -1.0   # speed
+        low[self.num_sensors + 4] = -1.0   # pa_v
+        low[self.num_sensors + 5] = -1.0   # pa_w
+        low[self.num_sensors + 8] = -1.0   # speed
+        low[self.num_sensors + 9] = -1.0   # omega
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
-        if self.action_mode == "continuous":
-            self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
-        elif self.action_mode == "car_continuous":
-            self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
-        elif self.action_mode == "extended":
-            self.action_space = spaces.Discrete(6)
-        elif self.action_mode == "car":
-            self.action_space = spaces.Discrete(5)
-        else:
-            self.action_space = spaces.Discrete(3)
+        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
 
         # ---- Internal state (set in reset) ----
         self.robot_pos: np.ndarray = np.zeros(2)
@@ -129,20 +142,22 @@ class RobotNavEnv(gym.Env):
         self._obstacle_boundaries: list = []
         self.obstacle_vels: list = []        # Dynamic velocities
         self.step_count: int = 0
-        self.robot_speed: float = 0.0        # For car_continuous mode
+        
+        # Physics state
+        self.v: float = 0.0
+        self.omega: float = 0.0
+        self.err_v_sum: float = 0.0
+        self.err_omega_sum: float = 0.0
+        self.last_err_v: float = 0.0
+        self.last_err_omega: float = 0.0
+        self.ekf = None
+        
         self._prev_goal_dist: float = 0.0
         self._prev_action = None
         self._smoothed_action = None
         self.lidar_distances: np.ndarray = np.zeros(self.num_sensors)
 
-        # Pre-build wall segments (constant for a given world size)
-        W, H = self.world_w, self.world_h
-        self._walls = [
-            LineString([(0, 0), (W, 0)]),
-            LineString([(W, 0), (W, H)]),
-            LineString([(W, H), (0, H)]),
-            LineString([(0, H), (0, 0)]),
-        ]
+
 
     # ==================================================================
     # Obstacle generation
@@ -206,9 +221,9 @@ class RobotNavEnv(gym.Env):
         tmin_w = max(min(tx1, tx2), min(ty1, ty2))
         tmax_w = min(max(tx1, tx2), max(ty1, ty2))
         
-        if tmax_w >= tmin_w and tmin_w > 0.0:
-            if tmin_w < min_t:
-                min_t = tmin_w
+        if tmax_w >= tmin_w and tmax_w > 0.0:
+            if tmax_w < min_t:
+                min_t = tmax_w
                 
         # Check intersection with obstacles
         for (x, y, w, h) in self.obstacle_rects:
@@ -253,10 +268,30 @@ class RobotNavEnv(gym.Env):
     # ==================================================================
     def _get_obs(self) -> np.ndarray:
         lidar = self._get_lidar()                               # [0..N-1]
+        
+        # Add noise to LIDAR
+        lidar = lidar * self.sensor_range
+        noise = np.random.normal(0, self.lidar_noise_std, size=lidar.shape)
+        lidar = np.clip(lidar + noise, 0, self.sensor_range)
+        lidar = (lidar / self.sensor_range).astype(np.float32)
 
-        # Relative goal in robot-local frame
-        delta = self.goal_pos - self.robot_pos
-        cos_a, sin_a = np.cos(-self.robot_angle), np.sin(-self.robot_angle)
+        # Measurement for EKF
+        noisy_x = self.robot_pos[0] + np.random.normal(0, self.odom_noise_std)
+        noisy_y = self.robot_pos[1] + np.random.normal(0, self.odom_noise_std)
+        noisy_theta = self.robot_angle + np.random.normal(0, 0.05)
+        noisy_v = self.v + np.random.normal(0, self.odom_noise_std)
+        noisy_omega = self.omega + np.random.normal(0, 0.05)
+        
+        if self.ekf is not None:
+            z = np.array([noisy_x, noisy_y, noisy_theta, noisy_v, noisy_omega])
+            self.ekf.update(z)
+            est_x, est_y, est_theta, est_v, est_omega = self.ekf.get_state()
+        else:
+            est_x, est_y, est_theta, est_v, est_omega = self.robot_pos[0], self.robot_pos[1], self.robot_angle, self.v, self.omega
+
+        # Relative goal in robot-local frame using ESTIMATED state
+        delta = self.goal_pos - np.array([est_x, est_y])
+        cos_a, sin_a = np.cos(-est_theta), np.sin(-est_theta)
         local_dx = delta[0] * cos_a - delta[1] * sin_a
         local_dy = delta[0] * sin_a + delta[1] * cos_a
         diag = np.sqrt(self.world_w ** 2 + self.world_h ** 2)
@@ -266,17 +301,16 @@ class RobotNavEnv(gym.Env):
 
         # Angle to goal relative to heading (normalised [-1, 1])
         goal_angle = np.arctan2(delta[1], delta[0])
-        angle_diff = self._angle_diff(self.robot_angle, goal_angle) / np.pi
+        angle_diff = self._angle_diff(est_theta, goal_angle) / np.pi
 
-        # Previous action (normalised to [0, 1])
-        if self.action_mode in ("continuous", "car_continuous"):
-            pa = float(np.linalg.norm(self._prev_action)) / np.sqrt(2.0) if self._prev_action is not None else 0.0
-        elif self.action_mode == "extended":
-            pa = (self._prev_action if self._prev_action is not None else 0) / 5.0
-        elif self.action_mode == "car":
-            pa = (self._prev_action if self._prev_action is not None else 0) / 4.0
+        # Previous action
+        if self._prev_action is not None:
+            if isinstance(self._prev_action, np.ndarray) and len(self._prev_action) == 2:
+                pa_v, pa_w = float(self._prev_action[0]), float(self._prev_action[1])
+            else:
+                pa_v, pa_w = float(np.linalg.norm(self._prev_action)) / np.sqrt(2.0), 0.0
         else:
-            pa = (self._prev_action if self._prev_action is not None else 0) / 2.0
+            pa_v, pa_w = 0.0, 0.0
 
         # Step progress (urgency signal)
         step_norm = self.step_count / self.max_steps
@@ -285,11 +319,14 @@ class RobotNavEnv(gym.Env):
         min_lidar = float(np.min(lidar))
 
         # Speed (normalised)
-        speed_norm = self.robot_speed / self.step_size
+        speed_norm = est_v / (self.motor_torque_max * self.wheel_radius / self.mass)
+
+        # Angular Speed (normalised)
+        omega_norm = est_omega / (2.0 * np.pi)
 
         extras = np.array(
             [local_dx / diag, local_dy / diag, goal_dist, angle_diff,
-             pa, step_norm, min_lidar, speed_norm],
+             pa_v, pa_w, step_norm, min_lidar, speed_norm, omega_norm],
             dtype=np.float32,
         )
         obs = np.concatenate([lidar, extras])
@@ -328,9 +365,7 @@ class RobotNavEnv(gym.Env):
         super().reset(seed=seed)
 
         # Domain Randomization (±15% to physics)
-        self.step_size = self.base_step_size * float(self.np_random.uniform(0.85, 1.15))
-        self.turn_angle = self.base_turn_angle * float(self.np_random.uniform(0.85, 1.15))
-        self.sensor_range = self.base_sensor_range * float(self.np_random.uniform(0.85, 1.15))
+        # (Physics randomization only. We don't randomize sensor_range because it breaks the neural network's spatial scale invariance)
 
         margin = 60
         self.robot_pos = np.array([
@@ -346,10 +381,21 @@ class RobotNavEnv(gym.Env):
 
         self._generate_obstacles()
         self.step_count = 0
-        self.robot_speed = 0.0
+        self.v = 0.0
+        self.omega = 0.0
+        self.err_v_sum = 0.0
+        self.err_omega_sum = 0.0
+        self.last_err_v = 0.0
+        self.last_err_omega = 0.0
+        
+        self.ekf = RobotEKF(
+            init_x=self.robot_pos[0],
+            init_y=self.robot_pos[1],
+            init_theta=self.robot_angle,
+            dt=self.dt
+        )
         
         self.lidar_distances = np.full(self.num_sensors, self.sensor_range)
-        self.lidar_intersections = [None] * self.num_sensors
 
         self.step_count = 0
         self._prev_goal_dist = float(np.linalg.norm(self.robot_pos - self.goal_pos))
@@ -383,75 +429,66 @@ class RobotNavEnv(gym.Env):
                 self.obstacles[i] = rect
                 self._obstacle_boundaries[i] = rect.boundary
 
-        # ---- Execute action ----
-        if self.action_mode == "continuous":
-            lin, ang = action
-            self.robot_angle += ang * self.turn_angle
-            self.robot_pos = self.robot_pos + lin * self.step_size * np.array(
-                [np.cos(self.robot_angle), np.sin(self.robot_angle)]
-            )
-        elif self.action_mode == "car_continuous":
-            raw_accel, raw_steer = action
+        # ---- Execute action (Differential Drive) ----
+        # The action is interpreted as target linear and angular velocities
+        # Normalised action [-1, 1], map it to some reasonable target speeds
+        target_v = action[0] * 100.0 # max speed 100 pixels/s (10 pixels per step if dt=0.1)
+        target_omega = action[1] * np.pi * 2.0 # max turn speed 2*pi rad/s
+        
+        dt_phys = self.dt / self.physics_substeps
+        
+        for _ in range(self.physics_substeps):
+            # 1. PID Control to calculate required wheel torques
+            err_v = target_v - self.v
+            self.err_v_sum += err_v * dt_phys
+            d_err_v = (err_v - self.last_err_v) / dt_phys
+            force_target = self.pid_kp * err_v + self.pid_ki * self.err_v_sum + self.pid_kd * d_err_v
+            self.last_err_v = err_v
             
-            # Action Smoothing (Low-Pass Filter) - made less sluggish
-            if self._smoothed_action is None:
-                self._smoothed_action = np.array([raw_accel, raw_steer], dtype=float)
-            else:
-                self._smoothed_action = 0.5 * self._smoothed_action + 0.5 * np.array([raw_accel, raw_steer])
-                
-            accel, steer = self._smoothed_action
+            err_omega = target_omega - self.omega
+            self.err_omega_sum += err_omega * dt_phys
+            d_err_omega = (err_omega - self.last_err_omega) / dt_phys
+            torque_target = self.pid_kp * err_omega + self.pid_ki * self.err_omega_sum + self.pid_kd * d_err_omega
+            self.last_err_omega = err_omega
             
-            # Nerf reverse acceleration so driving backward is slower
-            if accel < 0:
-                accel *= 0.4
-                
-            # Update speed with acceleration and simple friction
-            self.robot_speed += accel * (self.step_size * 0.5)
-            self.robot_speed *= 0.90  # friction decay
-            self.robot_speed = float(np.clip(self.robot_speed, -self.step_size, self.step_size))
+            L = self.track_width
+            sum_F = force_target
+            diff_F = torque_target / (L / 2.0)
             
-            # Steer (steering effect is proportional to speed for realistic car physics, 
-            # though we allow a tiny bit of turn-in-place for RL ease if needed)
-            speed_ratio = abs(self.robot_speed) / self.step_size
-            self.robot_angle += steer * self.turn_angle * max(0.2, speed_ratio)
+            F_R = (sum_F + diff_F) / 2.0
+            F_L = (sum_F - diff_F) / 2.0
             
-            self.robot_pos = self.robot_pos + self.robot_speed * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
+            # Convert to motor torques (tau = F * r)
+            tau_R = F_R * self.wheel_radius
+            tau_L = F_L * self.wheel_radius
             
-        elif self.action_mode == "car":
-            if action == 0:  # Forward
-                self.robot_pos = self.robot_pos + self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-            elif action == 1:  # Backward
-                self.robot_pos = self.robot_pos - self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-            elif action == 2:  # Turn Left
-                self.robot_angle -= self.turn_angle
-            elif action == 3:  # Turn Right
-                self.robot_angle += self.turn_angle
-            elif action == 4:  # Stop
-                pass  # Do nothing
-        elif self.action_mode == "extended":
-            if action == 0:  # FW
-                self.robot_pos = self.robot_pos + self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-            elif action == 1:  # L
-                self.robot_angle -= self.turn_angle
-            elif action == 2:  # R
-                self.robot_angle += self.turn_angle
-            elif action == 3:  # BW
-                self.robot_pos = self.robot_pos - self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-            elif action == 4:  # FW-L
-                self.robot_angle -= self.turn_angle
-                self.robot_pos = self.robot_pos + self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-            elif action == 5:  # FW-R
-                self.robot_angle += self.turn_angle
-                self.robot_pos = self.robot_pos + self.step_size * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)])
-        else: # basic
-            if action == 0:  # Forward
-                self.robot_pos = self.robot_pos + self.step_size * np.array(
-                    [np.cos(self.robot_angle), np.sin(self.robot_angle)]
-                )
-            elif action == 1:  # Turn left (CCW on screen)
-                self.robot_angle -= self.turn_angle
-            elif action == 2:  # Turn right (CW on screen)
-                self.robot_angle += self.turn_angle
+            # Clip torques to motor max
+            tau_R = np.clip(tau_R, -self.motor_torque_max, self.motor_torque_max)
+            tau_L = np.clip(tau_L, -self.motor_torque_max, self.motor_torque_max)
+            
+            # Convert back to actual forces applied
+            F_R_act = tau_R / self.wheel_radius
+            F_L_act = tau_L / self.wheel_radius
+            
+            # 2. Dynamics
+            F_total = F_R_act + F_L_act - (self.friction_coeff * self.v * self.mass)
+            Torque_total = (F_R_act - F_L_act) * (L / 2.0) - (self.friction_coeff * self.omega * self.inertia)
+            
+            dv = (F_total / self.mass) * dt_phys
+            domega = (Torque_total / self.inertia) * dt_phys
+            
+            self.v += dv
+            self.omega += domega
+            
+            # 3. Kinematics (update position)
+            self.robot_angle += self.omega * dt_phys
+            self.robot_pos += self.v * np.array([np.cos(self.robot_angle), np.sin(self.robot_angle)]) * dt_phys
+            
+        # EKF predict
+        if self.ekf is not None:
+            noisy_v = self.v + np.random.normal(0, self.odom_noise_std)
+            noisy_omega = self.omega + np.random.normal(0, 0.05)
+            self.ekf.predict(noisy_v, noisy_omega, dt_phys)
 
         self.robot_angle %= 2.0 * np.pi
 
@@ -502,38 +539,21 @@ class RobotNavEnv(gym.Env):
                     reward -= self.rw_prox * (1.0 - min_sensor / self.rw_prox_thresh)
 
             # 4. Spin, reverse, and jerk penalty
-            if self.action_mode in ("continuous", "car_continuous"):
-                # Continuous: penalize high jerk (squared change in action)
-                if prev_action is not None:
-                    action_np = np.array(action)
-                    prev_action_np = np.array(prev_action)
-                    jerk = np.sum((action_np - prev_action_np) ** 2)
-                    reward -= self.rw_jerk * float(jerk)
+            # Continuous: penalize high jerk (squared change in action)
+            if prev_action is not None:
+                action_np = np.array(action)
+                prev_action_np = np.array(prev_action)
+                jerk = np.sum((action_np - prev_action_np) ** 2)
+                reward -= self.rw_jerk * float(jerk)
 
-                # Continuous: penalize high angular velocity without linear velocity
-                if abs(action[1]) > 0.5 and abs(action[0]) < 0.2:
-                    reward -= self.rw_spin
-                # Penalize driving backwards heavily
-                if getattr(self, "robot_speed", 0.0) < -0.1:
-                    reward -= 0.5
-            elif self.action_mode == "car":
-                # Car: actions 2=Turn Left, 3=Turn Right are turns
-                is_turn = action in (2, 3)
-                was_turn = prev_action is not None and prev_action in (2, 3)
-                if is_turn and was_turn:
-                    reward -= self.rw_spin
-            elif self.action_mode == "extended":
-                # Extended: actions 1=Left, 2=Right are pure turns
-                is_turn = action in (1, 2)
-                was_turn = prev_action is not None and prev_action in (1, 2)
-                if is_turn and was_turn:
-                    reward -= self.rw_spin
-            else:
-                # Basic: actions 1=Left, 2=Right are turns
-                is_turn = action in (1, 2)
-                was_turn = prev_action is not None and prev_action in (1, 2)
-                if is_turn and was_turn:
-                    reward -= self.rw_spin
+            # Continuous: penalize high angular velocity without linear velocity
+            if abs(action[1]) > 0.5 and abs(action[0]) < 0.2:
+                reward -= self.rw_spin
+            
+            # Penalize driving backwards heavily
+            if self.v < -0.1:
+                reward -= 0.5
+
         info = {
             "is_success": self._goal_reached(),
             "is_collision": self._check_collision()
@@ -574,14 +594,14 @@ class RobotNavEnv(gym.Env):
         if ns > 0:
             for i in range(ns):
                 angle = self.robot_angle + i * (2.0 * np.pi / ns)
-            dist = self.lidar_distances[i]
-            ex = rx + int(dist * np.cos(angle))
-            ey = ry + int(dist * np.sin(angle))
-            t = max(0.0, min(1.0, dist / self.sensor_range))
-            r_col = int(235 + (241 - 235) * t)
-            g_col = int(77 + (196 - 77) * t)
-            b_col = int(65 + (15 - 65) * t)
-            pygame.draw.line(surf, (r_col, g_col, b_col), (rx, ry), (ex, ey), 1)
+                dist = self.lidar_distances[i]
+                ex = rx + int(dist * np.cos(angle))
+                ey = ry + int(dist * np.sin(angle))
+                t = max(0.0, min(1.0, dist / self.sensor_range))
+                r_col = int(235 + (241 - 235) * t)
+                g_col = int(77 + (196 - 77) * t)
+                b_col = int(65 + (15 - 65) * t)
+                pygame.draw.line(surf, (r_col, g_col, b_col), (rx, ry), (ex, ey), 1)
 
         # Robot
         pygame.draw.circle(surf, (41, 128, 185), (rx, ry), int(self.robot_radius) + 3)

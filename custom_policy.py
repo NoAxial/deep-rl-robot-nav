@@ -11,20 +11,19 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
       2. State features (processed through an MLP)
     Then concatenates and merges them.
     """
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256, num_sensors: int = 32, n_stack: int = 4):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256, n_stack: int = 4, **kwargs):
         super().__init__(observation_space, features_dim)
         
-        self.num_sensors = num_sensors
         self.n_stack = n_stack
-        self.obs_dim_per_frame = num_sensors + 8 # 32 sensors + 8 state features
         
-        # Verify observation shape matches expected stacked shape
+        # Calculate num_sensors dynamically from the flattened observation space
         import math
-        expected_dim = self.obs_dim_per_frame * self.n_stack
-        actual_dim = math.prod(observation_space.shape)
-        assert actual_dim == expected_dim, f"Expected obs shape {expected_dim}, got {observation_space.shape}"
+        total_dim = math.prod(observation_space.shape)
+        self.obs_dim_per_frame = total_dim // self.n_stack
+        self.num_sensors = self.obs_dim_per_frame - 10 # 10 state features
+        
+        assert total_dim % self.n_stack == 0, f"Total dim {total_dim} not divisible by n_stack {self.n_stack}"
 
-        # LIDAR Pathway: We have (n_stack * num_sensors) features.
         # LIDAR Pathway: We have (n_stack * num_sensors) features.
         # We use a very lightweight 1D CNN over the spatial LIDAR dimension, treating n_stack as channels.
         # This allows the network to learn temporal motion (velocity) of obstacles from the frame stack!
@@ -41,10 +40,10 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         # After Conv 1 (stride 2): [batch, 16, 16]
         # After Conv 2 (stride 2): [batch, 32, 8]
         # Flattened: 32 * 8 = 256
-        cnn_out_dim = 32 * (num_sensors // 4)
+        cnn_out_dim = 32 * (self.num_sensors // 4)
         
-        # State Pathway: n_stack * 8 features
-        state_in_dim = n_stack * 8
+        # State Pathway: n_stack * 10 features
+        state_in_dim = n_stack * 10
         self.state_mlp = nn.Sequential(
             nn.Linear(state_in_dim, 64),
             nn.ReLU(),
@@ -70,7 +69,7 @@ class CustomCombinedExtractor(BaseFeaturesExtractor):
         lidar_obs = obs_reshaped[:, :, :self.num_sensors] # Shape: [batch_size, n_stack, num_sensors]
         
         # State: remaining elements
-        state_obs = obs_reshaped[:, :, self.num_sensors:] # Shape: [batch_size, n_stack, 8]
+        state_obs = obs_reshaped[:, :, self.num_sensors:] # Shape: [batch_size, n_stack, 10]
         
         # Pass LIDAR through CNN
         lidar_features = self.lidar_cnn(lidar_obs)

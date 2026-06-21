@@ -12,16 +12,16 @@ A high-performance, custom-built Reinforcement Learning framework for training a
 
 ## ✨ Key Features
 
-- **Hyper-Optimized Physics Engine:** Built natively in `numpy` using pure mathematical AABB (Axis-Aligned Bounding Box) and radial collision algorithms. Bypasses heavy geometry libraries (like Shapely) to achieve **>1,300 FPS** training speeds on a standard CPU.
+- **Differential Drive Physics Engine:** Built natively in `numpy` using mathematical AABB (Axis-Aligned Bounding Box) and radial collision algorithms coupled with a custom Extended Kalman Filter (EKF) for precise odometry tracking.
 - **Temporal Motion Prediction:** Uses a `VecFrameStack` of the last 4 frames fed into a custom PyTorch 1D CNN over the spatial LIDAR dimension. The agent natively calculates velocity and predicts the future positions of dynamic obstacles.
 - **Automated Curriculum Learning:** Features a dynamic difficulty scaler (`curriculum.py`) that monitors the agent's rolling success rate. It automatically scales obstacle density, shrinks the goal radius, and activates dynamic moving obstacles as the agent masters early stages.
 - **Dual-Hardware Asynchronous Execution:** Fully optimized to run the vectorized environments (Simulator) on the CPU while offloading the SAC neural network gradient backpropagation to a CUDA-enabled GPU.
-- **Live Pygame Visualization:** Includes a beautiful, live-rendering training dashboard (`train_visual.py`) to watch the robot learn in real-time with comprehensive graphs and metrics.
+- **Live Pygame Visualization:** Includes a beautiful, live-rendering training dashboard to watch the robot learn in real-time with comprehensive graphics.
 
 ## 🏗️ Architecture
 
 - **Algorithm:** Soft Actor-Critic (SAC) - Continuous Control
-- **State Space:** 40 Dimensions
+- **State Space:** 42 Dimensions
   - 32-Ray 360° LIDAR (Stacked 4x = 128 channels)
   - 8 Vector State Features (Relative Goal Dist/Angle, Velocity, Previous Action, Urgency)
 - **Action Space:** Continuous `[-1.0, 1.0]` (Acceleration, Steering)
@@ -57,13 +57,13 @@ python run.py train
 **2. Live Visual Training**
 Trains the agent while rendering the environment and live analytics dashboard via Pygame.
 ```bash
-python run.py train_visual
+python train_visual.py
 ```
 
 **3. Evaluate / Visualize a Trained Model**
 Watch a trained model navigate the environment. (Requires `best_model/` or a saved `.zip` file).
 ```bash
-python run.py visualize
+python run.py view
 ```
 
 ## ⚙️ Configuration
@@ -75,7 +75,7 @@ python run.py train --config configs/hard.yaml
 ## 📊 Analytics
 Run the analytics dashboard to generate charts and evaluate the convergence of your saved models.
 ```bash
-python run.py analytics
+python run.py analyze
 ```
 
 ## 📜 License
