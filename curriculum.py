@@ -17,16 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 class PerformanceCurriculumCallback(BaseCallback):
-    def __init__(self, raw_envs, window_size: int = 50, advance_threshold: float = 0.8, demote_threshold: float = 0.4, verbose: int = 1):
+    def __init__(self, window_size: int = 50, advance_threshold: float = 0.8, demote_threshold: float = 0.3, min_episodes_per_stage: int = 100, verbose: int = 1):
         super().__init__(verbose)
-        if isinstance(raw_envs, list):
-            self.raw_envs = raw_envs
-        else:
-            self.raw_envs = [raw_envs]
             
         self.window_size = window_size
         self.advance_threshold = advance_threshold
         self.demote_threshold = demote_threshold
+        self.min_episodes_per_stage = min_episodes_per_stage
         
         # Track history of success (True/False)
         self.history = collections.deque(maxlen=window_size)
@@ -34,6 +31,10 @@ class PerformanceCurriculumCallback(BaseCallback):
         self.current_stage = 1
         self.max_stage = 10
         self.cooldown = 0
+        self.stage_episode_count = 0
+        # Grace period: freeze demotions for N episodes after any stage change
+        self.grace_steps_remaining = 0
+        self.grace_period = min_episodes_per_stage * 2
         
     def _apply_stage(self):
         # Linearly interpolate difficulty based on stage 1 to 10
@@ -46,21 +47,16 @@ class PerformanceCurriculumCallback(BaseCallback):
         # Goal radius: from 30 to 10
         goal_radius = 30.0 - t * 20.0
         
-        # Dynamic obstacles turn on at stage 5 (halfway)
-        dynamic = self.current_stage >= 5
-        
-        for env in self.raw_envs:
-            env.obs_min_n = obs_min
-            env.obs_max_n = obs_max
-            env.goal_radius = goal_radius
-            env.dynamic_obstacles = dynamic
+        if self.training_env:
+            self.training_env.set_attr('obs_min_n', obs_min)
+            self.training_env.set_attr('obs_max_n', obs_max)
+            self.training_env.set_attr('goal_radius', goal_radius)
         
         if self.verbose > 0:
             success_rate = np.mean(self.history) if len(self.history) > 0 else 0.0
             print(f"\n[Curriculum] >>> MOVED TO STAGE {self.current_stage}/{self.max_stage} (Success Rate: {success_rate*100:.1f}%) <<<")
             print(f"             Obstacles: {obs_min}-{obs_max}")
             print(f"             Goal Radius: {goal_radius:.1f}")
-            print(f"             Dynamic Obstacles: {dynamic}")
             
     def _on_training_start(self) -> None:
         self._apply_stage()
@@ -71,25 +67,38 @@ class PerformanceCurriculumCallback(BaseCallback):
         
         for idx, done in enumerate(dones):
             if done:
+                self.stage_episode_count += 1
                 # Add success to history
                 is_success = infos[idx].get("is_success", False)
                 self.history.append(is_success)
                 
                 # Check for stage advancement or demotion if history is full
                 if len(self.history) == self.window_size and self.cooldown <= 0:
-                    success_rate = np.mean(self.history)
-                    
-                    if success_rate >= self.advance_threshold and self.current_stage < self.max_stage:
-                        self.current_stage += 1
-                        self.cooldown = self.window_size // 2  # wait before changing again
-                        self.history.clear()
-                        self._apply_stage()
-                    elif success_rate <= self.demote_threshold and self.current_stage > 1:
-                        self.current_stage -= 1
-                        self.cooldown = self.window_size // 2
-                        self.history.clear()
-                        self._apply_stage()
-                else:
+                    if self.stage_episode_count >= self.min_episodes_per_stage:
+                        success_rate = np.mean(self.history)
+                        
+                        new_stage = self.current_stage
+                        
+                        # Advance if performing well
+                        if success_rate >= self.advance_threshold and self.current_stage < self.max_stage:
+                            new_stage += 1
+                        # Only demote if not in grace period after a recent stage change
+                        elif (success_rate <= self.demote_threshold
+                              and self.current_stage > 1
+                              and self.grace_steps_remaining <= 0):
+                            new_stage -= 1
+
+                        if new_stage != self.current_stage:
+                            self.current_stage = new_stage
+                            self.cooldown = self.window_size // 2
+                            self.stage_episode_count = 0
+                            self.history.clear()
+                            self.grace_steps_remaining = self.grace_period
+                            self._apply_stage()
+
+                # Decrement cooldown and grace period once per episode
+                if self.cooldown > 0:
                     self.cooldown -= 1
-                    
+                if self.grace_steps_remaining > 0:
+                    self.grace_steps_remaining -= 1
         return True

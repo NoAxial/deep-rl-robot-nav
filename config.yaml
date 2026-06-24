@@ -15,57 +15,67 @@ world:
   obstacle_width_max: 120
   obstacle_height_min: 30
   obstacle_height_max: 90
-  dynamic_obstacles: false
-  dynamic_speed_min: 1.0
-  dynamic_speed_max: 3.0
 
 robot:
   radius: 12
-  step_size: 5.0
-  turn_angle: 15            # degrees
-  num_sensors: 32           # HD LIDAR
+  num_sensors: 16
   sensor_range: 200
+  max_linear_speed: 100.0   # pixels / second
+  max_angular_speed: 6.283185307179586  # radians / second
 
 goal:
   radius: 20
 
+sensors:
+  lidar_distribution: uniform
+  front_arc_ratio: 0.5
+  front_arc_degrees: 120
+  ekf_update_freq: 10
+
+control:
+  pid_kp: 5.0
+  pid_ki: 0.1
+  pid_kd: 0.5
+  ema_alpha: 0.3
+
 rewards:
-  goal: 100.0
-  collision: -10.0
-  step_penalty: -0.05
-  velocity_reward: 0.5
-  clear_path_reward: 0.1
-  distance_shaping: 0.0
-  heading_bonus: 0.0
-  proximity_penalty: 0.5
-  proximity_threshold: 0.25
-  speed_bonus: 50.0
-  spin_penalty: 0.05
-  jerk_penalty: 0.1
+  goal: 50.0
+  collision: -50.0
+  step_penalty: -0.01
+  velocity_reward: 0.05
+  # ---- Pure Kinematic Smooth Navigation Rewards ----
+  distance_shaping: 0.05       # heavily reward decreasing distance to goal
+  heading_bonus: 0.1          # massively reward facing the goal
+  proximity_penalty: 0.15       # much higher penalty for being near obstacles
+  proximity_threshold: 0.3     # trigger avoidance much earlier (30% of lidar range)
+  speed_bonus: 2.0            # lower speed incentive to prevent reckless rushing
+  spin_penalty: 0.1           # double the penalty for rapid spinning
+  jerk_penalty: 0.15          # triple the penalty for jerky movements
+  reverse_penalty: 0.2         # absolutely destroy the reward for going backwards
 
 training:
-  algorithm: "SAC"
+  algorithm: SAC
   # Training process
-  total_timesteps: 100000
-  eval_freq: 5000
-  n_envs: 4
-  learning_rate: 0.001
-  buffer_size: 100000
-  batch_size: 256
+  total_timesteps: 200000
+  n_envs: 8
+  learning_rate: 0.0003          # was 0.001 — standard SAC LR for stable long runs
+  buffer_size: 500000            # was 100k — larger replay buffer = more diverse samples
+  batch_size: 256                # was 2048 — 2048 is for PPO; SAC standard is 256
+  n_epochs: 3
   tau: 0.005
   gamma: 0.99
   train_freq: 1
-  gradient_steps: 1
-  learning_starts: 1000
-  ent_coef: "auto_0.1"
+  gradient_steps: 8              # was 1 — use 8 parallel envs more efficiently
+  learning_starts: 5000          # was 1000 — fill buffer more before first update
+  ent_coef: auto                 # was 0.01 (fixed) — enable SAC auto entropy tuning
   device: cpu
   early_stopping: false
   reward_threshold: 120.0
-  eval_freq: 5000
+  eval_freq: 10000
   n_eval_episodes: 20
-  normalize_obs: true
+  normalize_obs: false
   normalize_reward: true
-  net_arch_pi: [64, 64]
+  net_arch_pi: [256, 256]        # was [64, 64] — larger actor to match task complexity
   net_arch_vf: [256, 256, 128]
   activation: relu
 

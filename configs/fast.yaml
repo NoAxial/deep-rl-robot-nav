@@ -8,8 +8,8 @@
 
 robot:
   radius: 15
-  step_size: 8.0
-  turn_angle: 25
+  max_linear_speed: 140.0
+  max_angular_speed: 7.0
 
 training:
   total_timesteps: 100000

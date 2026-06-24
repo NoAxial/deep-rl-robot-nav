@@ -12,15 +12,20 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import SAC
+import stable_baselines3
+try:
+    import sb3_contrib
+except ImportError:
+    sb3_contrib = None
+from matplotlib.collections import PatchCollection
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecFrameStack
 
 from config import load_config
 from robot_env import RobotNavEnv
+from model_utils import normalization_path_for, resolve_model_path
 
 
 def generate_analytics(model_path: str, config_path: str | None = None, num_episodes: int = 100):
@@ -29,23 +34,32 @@ def generate_analytics(model_path: str, config_path: str | None = None, num_epis
     # Disable dynamic obstacles during analytics to get a clear heatmap of static navigation
     cfg["world"]["dynamic_obstacles"] = False
 
+    try:
+        resolved_model = resolve_model_path(model_path)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}. Please train first.")
+        return
+
     raw_env = RobotNavEnv(config=cfg)
     vec_env = DummyVecEnv([lambda: raw_env])
-
-    # Wrap with Frame Stacking
     vec_env = VecFrameStack(vec_env, n_stack=4)
 
-    norm_path = Path("vec_normalize.pkl")
-    if norm_path.exists():
+    norm_path = normalization_path_for(resolved_model)
+    if norm_path.is_file():
         vec_env = VecNormalize.load(str(norm_path), vec_env)
         vec_env.training = False
         vec_env.norm_reward = False
+    elif cfg["training"]["normalize_obs"]:
+        print(f"Warning: normalization statistics not found beside {resolved_model}")
 
-    try:
-        model = SAC.load(model_path)
-    except FileNotFoundError:
-        print(f"Error: Model not found at {model_path}. Please train first.")
-        return
+    algo_name = cfg.get("training", {}).get("algorithm", "SAC")
+    if algo_name in ["RecurrentPPO", "TQC"] and sb3_contrib:
+        AlgoClass = getattr(sb3_contrib, algo_name)
+    else:
+        AlgoClass = getattr(stable_baselines3, algo_name)
+
+    model = AlgoClass.load(str(resolved_model))
+    print(f"Loaded model: {resolved_model}")
 
     print(f"Running {num_episodes} evaluation episodes...")
 
@@ -61,16 +75,19 @@ def generate_analytics(model_path: str, config_path: str | None = None, num_epis
     # Simple manual approximation of reward breakdown (since environment groups them)
     # We will log successful vs collision terminations
     outcomes = {"Goal Reached": 0, "Collision": 0, "Timeout": 0}
+    ep_data = []
+
+    obs = vec_env.reset()
 
     for ep in range(num_episodes):
-        obs = vec_env.reset()
-        
         # Save this episode's geometry
         all_obstacles.extend(raw_env.obstacle_rects.copy())
         all_goals.append((raw_env.goal_pos.copy(), raw_env.goal_radius))
         
         traj = []
         ep_len = 0
+        ep_reward = 0.0
+        n_obstacles = len(raw_env.obstacles)
         done = False
         
         while not done:
@@ -80,18 +97,29 @@ def generate_analytics(model_path: str, config_path: str | None = None, num_epis
             
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, dones, infos = vec_env.step(action)
+            ep_reward += reward[0]
             ep_len += 1
             
             if dones[0]:
                 done = True
-                r = reward[0]
-                if r > 50:
+                info = infos[0]
+                terminal_info = info.get('terminal_info', info)
+                if terminal_info.get("is_success", False):
                     outcomes["Goal Reached"] += 1
-                elif r < -5:
+                    outcome_str = "Goal Reached"
+                elif terminal_info.get("is_collision", False):
                     outcomes["Collision"] += 1
-                    collision_points.append(raw_env.robot_pos.copy())
+                    collision_points.append(traj[-1].copy())
+                    outcome_str = "Collision"
                 else:
                     outcomes["Timeout"] += 1
+                    outcome_str = "Timeout"
+
+                ep_data.append({
+                    "n_obstacles": n_obstacles,
+                    "ep_reward": ep_reward,
+                    "outcome": outcome_str
+                })
 
         all_trajectories.append(np.array(traj))
         episode_lengths.append(ep_len)
@@ -121,9 +149,12 @@ def generate_analytics(model_path: str, config_path: str | None = None, num_epis
     # Calculate a suitable alpha based on episode count
     alpha_val = max(0.02, min(0.3, 5.0 / num_episodes))
     
+    patches_list = []
     for (ox, oy, ow, oh) in all_obstacles:
-        rect = plt.Rectangle((ox, oy), ow, oh, facecolor="#e74c3c", alpha=alpha_val, edgecolor="none")
-        ax1.add_patch(rect)
+        patches_list.append(plt.Rectangle((ox, oy), ow, oh))
+    
+    collection = PatchCollection(patches_list, facecolor="#e74c3c", alpha=alpha_val, edgecolor="none")
+    ax1.add_collection(collection)
         
     for g_pos, g_rad in all_goals:
         circle = plt.Circle((g_pos[0], g_pos[1]), g_rad, color="#2ecc71", alpha=alpha_val, edgecolor="none")
@@ -157,7 +188,29 @@ def generate_analytics(model_path: str, config_path: str | None = None, num_epis
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig("analytics_dashboard.png", dpi=150)
-    print("\nDashboard saved to 'analytics_dashboard.png'. Displaying now...")
+    print("\nDashboard saved to 'analytics_dashboard.png'.")
+
+    # 4. Success by Density Stacked Bar Chart
+    import pandas as pd
+    df = pd.DataFrame(ep_data)
+    if not df.empty:
+        density_outcomes = df.groupby(['n_obstacles', 'outcome']).size().unstack(fill_value=0)
+        for col in ["Goal Reached", "Collision", "Timeout"]:
+            if col not in density_outcomes.columns:
+                density_outcomes[col] = 0
+        density_outcomes = density_outcomes[["Goal Reached", "Collision", "Timeout"]]
+        
+        fig2, ax_dens = plt.subplots(figsize=(8, 6))
+        density_outcomes.plot(kind='bar', stacked=True, color=colors, ax=ax_dens, edgecolor='black')
+        ax_dens.set_title("Episode Outcomes by Obstacle Density")
+        ax_dens.set_xlabel("Number of Obstacles")
+        ax_dens.set_ylabel("Number of Episodes")
+        plt.tight_layout()
+        plt.savefig("success_by_density.png", dpi=150)
+        plt.close(fig2)
+        print("Success by density chart saved to 'success_by_density.png'.")
+
+    vec_env.close()
     plt.show()
 
 

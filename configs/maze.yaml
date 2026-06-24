@@ -16,8 +16,9 @@ world:
   obstacle_height_max: 200
 
 robot:
-  step_size: 4.0
   sensor_range: 150
+  max_linear_speed: 70.0
+  max_angular_speed: 4.0
 
 training:
   total_timesteps: 300000

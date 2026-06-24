@@ -17,8 +17,9 @@ world:
   obstacle_height_max: 150
 
 robot:
-  step_size: 4.0
   sensor_range: 120
+  max_linear_speed: 70.0
+  max_angular_speed: 4.0
 
 goal:
   radius: 15

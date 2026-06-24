@@ -28,6 +28,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "obstacle_width_max": 120,
         "obstacle_height_min": 30,
         "obstacle_height_max": 90,
+        "dynamic_obstacles": False,
+        "dynamic_speed_min": 1.0,
+        "dynamic_speed_max": 3.0,
     },
     "robot": {
         "radius": 12,
@@ -49,16 +52,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sensors": {
         "lidar_noise_std": 2.0,    # Standard deviation of LIDAR noise
         "odom_noise_std": 0.5,     # Standard deviation of odometry noise
-        "lidar_distribution": "non_uniform",
-        "front_arc_ratio": 0.5,
-        "front_arc_degrees": 120,
-        "ekf_update_freq": 10,     # EKF GPS/SLAM update runs every N steps (sim-to-real)
     },
     "control": {
         "pid_kp": 5.0,             # Proportional gain
         "pid_ki": 0.1,             # Integral gain
         "pid_kd": 0.5,             # Derivative gain
-        "ema_alpha": 0.3,          # Action EMA smoothing factor (0=no change, 1=no smoothing)
     },
     "goal": {
         "radius": 20,
@@ -66,29 +64,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rewards": {
         "goal": 200.0,
         "collision": -100.0,
-        "step_penalty": 0.05,
+        "step_penalty": -0.05,
         "velocity_reward": 0.5,
-        "distance_shaping": 0.2,
-        "heading_bonus": 0.1,
-        "proximity_penalty": 2.0,
-        "proximity_threshold": 25.0,
-        "speed_bonus": 0.5,
-        "spin_penalty": 0.3,
-        "jerk_penalty": 0.1,
-        "smoothness_penalty": 0.03,
-        "smoothness_window": 5,
-        "reverse_penalty": 0.5,
-        "clear_path_reward": 0.1,
-        "clearance_reward": 1.0,
-        # ---- Phase-aware explore-then-exploit rewards ----
-        "exploration_info_gain": 0.3,    # reward per new cell during exploration
-        "goal_info_gain": 0.02,          # reward per new cell once goal is visible
-        "target_acquisition_bonus": 10.0,  # one-time bonus on first goal LoS
-        "target_visible_bonus": 0.15,    # per-step bonus while LoS to goal is held
+        "clear_path_reward": 0.05,
+        "distance_shaping": 0.0,      
+        "heading_bonus": 0.0,         
+        "proximity_penalty": 0.2,
+        "proximity_threshold": 0.1,
+        "speed_bonus": 50.0,
+        "spin_penalty": 0.05,
+        "jerk_penalty": 0.02,
     },
     "training": {
         "algorithm": "SAC",
-        "total_timesteps": 5_000_000,
+        "total_timesteps": 2_000_000,
         "n_envs": 4,
         "learning_rate": 0.001,
         "buffer_size": 100_000,
@@ -127,7 +116,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
-            result[key] = value
+            result[key] = copy.deepcopy(value)
     return result
 
 
@@ -137,7 +126,7 @@ def _apply_legacy_robot_config(user: dict[str, Any], config: dict[str, Any]) -> 
     if not isinstance(robot_override, dict):
         return
 
-    dt = 0.1 # default fixed step time
+    dt = float(config["physics"]["dt"])
     if "step_size" in robot_override and "max_linear_speed" not in robot_override:
         config["robot"]["max_linear_speed"] = float(robot_override["step_size"]) / dt
     if "turn_angle" in robot_override and "max_angular_speed" not in robot_override:
@@ -150,7 +139,7 @@ def _validate_config(config: dict[str, Any]) -> None:
     """Fail early for values that would otherwise break an episode or model."""
     world = config["world"]
     robot = config["robot"]
-    goal = config["goal"]
+    physics = config["physics"]
     training = config["training"]
 
     if int(world["width"]) <= 200 or int(world["height"]) <= 120:
@@ -167,7 +156,13 @@ def _validate_config(config: dict[str, Any]) -> None:
         "robot.sensor_range": robot["sensor_range"],
         "robot.max_linear_speed": robot["max_linear_speed"],
         "robot.max_angular_speed": robot["max_angular_speed"],
-        "goal.radius": goal["radius"],
+        "physics.mass": physics["mass"],
+        "physics.inertia": physics["inertia"],
+        "physics.track_width": physics["track_width"],
+        "physics.wheel_radius": physics["wheel_radius"],
+        "physics.motor_torque_max": physics["motor_torque_max"],
+        "physics.dt": physics["dt"],
+        "physics.physics_substeps": physics["physics_substeps"],
         "episode.max_steps": config["episode"]["max_steps"],
         "training.n_envs": training["n_envs"],
     }
@@ -175,9 +170,10 @@ def _validate_config(config: dict[str, Any]) -> None:
         if float(value) <= 0:
             raise ValueError(f"{name} must be positive")
 
-    valid_algos = ["SAC", "TQC", "RecurrentPPO", "PPO", "TD3"]
-    if config["training"]["algorithm"] not in valid_algos:
-        raise ValueError(f"training.algorithm must be one of {valid_algos}")
+    if str(training["algorithm"]).upper() != "SAC":
+        raise ValueError(
+            "training.algorithm must be 'SAC'; use the compare command for PPO"
+        )
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
